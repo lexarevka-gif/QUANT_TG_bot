@@ -6,7 +6,7 @@ from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select
 from database import async_session
 from models import User
-from config import ADMIN_IDS
+from config import ADMIN_IDS, ADMIN_MIN_RANK
 from keyboards import admin_keyboard, worker_keyboard
 
 router = Router()
@@ -24,9 +24,10 @@ async def cmd_start(message: Message, state: FSMContext):
         user = result.scalar_one_or_none()
 
     if user:
-        kb = admin_keyboard() if user.role == "admin" else worker_keyboard()
-        role = "Админ" if user.role == "admin" else f"Работник"
-        await message.answer(f"Вы уже зарегистрированы как {role}.", reply_markup=kb)
+        is_adm = user.tg_id in ADMIN_IDS or user.rank >= ADMIN_MIN_RANK
+        kb = admin_keyboard() if is_adm else worker_keyboard()
+        role_text = "Админ" if is_adm else "Работник"
+        await message.answer(f"Вы уже зарегистрированы как {role_text}.", reply_markup=kb)
         return
 
     await state.set_state(Registration.full_name)
@@ -59,22 +60,22 @@ async def process_phone_text(message: Message, state: FSMContext):
 
 async def _finish_registration(message: Message, state: FSMContext, phone: str):
     data = await state.get_data()
-    role = "admin" if message.from_user.id in ADMIN_IDS else "worker"
+    is_adm = message.from_user.id in ADMIN_IDS
 
     async with async_session() as session:
         user = User(
             tg_id=message.from_user.id,
             full_name=data["full_name"],
             phone=phone,
-            role=role,
-            rank=1,
+            role="admin" if is_adm else "worker",
+            rank=ADMIN_MIN_RANK if is_adm else 1,
         )
         session.add(user)
         await session.commit()
 
     await state.clear()
-    kb = admin_keyboard() if role == "admin" else worker_keyboard()
-    role_text = "администратор" if role == "admin" else "работник"
+    kb = admin_keyboard() if is_adm else worker_keyboard()
+    role_text = "администратор" if is_adm else "работник"
     await message.answer(
         f"Регистрация завершена!\n"
         f"Имя: {data['full_name']}\n"

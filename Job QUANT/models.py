@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import BigInteger, String, Integer, Float, DateTime, ForeignKey, Text
+from sqlalchemy import BigInteger, String, Integer, Float, DateTime, ForeignKey, Text, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from database import Base
 import enum
@@ -27,6 +27,16 @@ class TaskStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+class Division(Base):
+    __tablename__ = "divisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    counts_for_coeff: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    tasks: Mapped[list["Task"]] = relationship(back_populates="division")
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -36,10 +46,22 @@ class User(Base):
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     rank: Mapped[int] = mapped_column(Integer, default=0)
     job_role: Mapped[str] = mapped_column(String(50), default="Без роли")
+    job_roles_json: Mapped[str] = mapped_column(Text, default="[]")
     role: Mapped[str] = mapped_column(String(10), default=UserRole.WORKER.value)
     registered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     applications: Mapped[list["TaskApplication"]] = relationship(back_populates="user")
+
+    @property
+    def job_roles(self) -> list[str]:
+        try:
+            return json.loads(self.job_roles_json)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    @job_roles.setter
+    def job_roles(self, value: list[str]):
+        self.job_roles_json = json.dumps(value, ensure_ascii=False)
 
 
 class Task(Base):
@@ -56,7 +78,12 @@ class Task(Base):
     status: Mapped[str] = mapped_column(String(20), default=TaskStatus.OPEN.value)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     created_by: Mapped[int] = mapped_column(BigInteger)
+    division_id: Mapped[int | None] = mapped_column(ForeignKey("divisions.id"), nullable=True)
+    max_workers: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_template: Mapped[bool] = mapped_column(Boolean, default=False)
+    job_role_filter: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
+    division: Mapped["Division | None"] = relationship(back_populates="tasks")
     applications: Mapped[list["TaskApplication"]] = relationship(back_populates="task")
 
     @property
@@ -68,8 +95,10 @@ class Task(Base):
         self.payment_rates_json = json.dumps(value)
 
     def rate_for_rank(self, rank: int) -> float:
+        from config import payment_tier_for_rank
         rates = self.payment_rates
-        return rates.get(rank, 0)
+        tier = payment_tier_for_rank(rank)
+        return rates.get(tier, 0)
 
 
 class TaskApplication(Base):
@@ -86,6 +115,8 @@ class TaskApplication(Base):
     confirmed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     penalty_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    attendance_confirmed: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
+    confirm_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="applications")
     task: Mapped["Task"] = relationship(back_populates="applications")
