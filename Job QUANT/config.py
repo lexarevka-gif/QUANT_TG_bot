@@ -5,8 +5,11 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE_URL = f"sqlite+aiosqlite:///{os.path.join(BASE_DIR, 'bot.db')}"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://localhost/quant_bot")
+
+WORKERS_PER_PAGE = 50
+BROADCAST_BATCH_SIZE = 25
+BROADCAST_DELAY = 1.0
 
 RANKS = {
     0: "Без ранга",

@@ -9,6 +9,8 @@ from config import ADMIN_IDS, get_coefficient, rank_name
 
 router = Router()
 
+MAX_MESSAGE_LEN = 4000
+
 
 @router.message(Command("payroll"))
 async def cmd_payroll(message: Message):
@@ -18,7 +20,10 @@ async def cmd_payroll(message: Message):
 
     async with async_session() as session:
         workers = (await session.execute(
-            select(User).where(User.role == "worker")
+            select(User)
+            .where(User.role == "worker")
+            .options(selectinload(User.applications).selectinload(TaskApplication.task))
+            .order_by(User.full_name)
         )).scalars().all()
 
     if not workers:
@@ -29,8 +34,19 @@ async def cmd_payroll(message: Message):
     total = 0.0
 
     for worker in workers:
-        earned, confirmed_count, penalties = await _calc_worker_pay(worker)
+        confirmed_apps = [
+            a for a in worker.applications
+            if a.status == ApplicationStatus.CONFIRMED.value
+        ]
+        penalties = sum(
+            a.penalty_amount for a in worker.applications
+            if a.status == ApplicationStatus.PENALTY.value
+        )
+
+        confirmed_count = len(confirmed_apps)
         coeff = get_coefficient(confirmed_count)
+        base_sum = sum(a.task.rate_for_rank(worker.rank) for a in confirmed_apps)
+        earned = base_sum * coeff - penalties
 
         lines.append(
             f"• {worker.full_name} | {rank_name(worker.rank)}\n"
@@ -40,25 +56,39 @@ async def cmd_payroll(message: Message):
         )
         total += earned
 
-    report = "💰 Расчёт оплаты:\n\n" + "\n\n".join(lines)
-    report += f"\n\n{'='*30}\nОбщий итог: {total:.0f}₽"
+    footer = f"\n{'=' * 30}\nОбщий итог: {total:.0f}₽"
+    header = "💰 Расчёт оплаты:\n\n"
 
-    await message.answer(report)
+    chunks = _split_report(header, lines, footer)
+    for chunk in chunks:
+        await message.answer(chunk)
 
 
 @router.message(Command("my_stats"))
 async def cmd_my_stats(message: Message):
     async with async_session() as session:
         user = (await session.execute(
-            select(User).where(User.tg_id == message.from_user.id)
+            select(User)
+            .where(User.tg_id == message.from_user.id)
+            .options(selectinload(User.applications).selectinload(TaskApplication.task))
         )).scalar_one_or_none()
 
         if not user:
             await message.answer("Сначала зарегистрируйтесь: /start")
             return
 
-    earned, confirmed_count, penalties = await _calc_worker_pay(user)
+    confirmed_apps = [
+        a for a in user.applications
+        if a.status == ApplicationStatus.CONFIRMED.value
+    ]
+    penalties = sum(
+        a.penalty_amount for a in user.applications
+        if a.status == ApplicationStatus.PENALTY.value
+    )
+    confirmed_count = len(confirmed_apps)
     coeff = get_coefficient(confirmed_count)
+    base_sum = sum(a.task.rate_for_rank(user.rank) for a in confirmed_apps)
+    earned = base_sum * coeff - penalties
 
     await message.answer(
         f"📊 Ваша статистика:\n\n"
@@ -70,25 +100,17 @@ async def cmd_my_stats(message: Message):
     )
 
 
-async def _calc_worker_pay(worker: User) -> tuple[float, int, float]:
-    async with async_session() as session:
-        confirmed_apps = (await session.execute(
-            select(TaskApplication)
-            .options(selectinload(TaskApplication.task))
-            .where(TaskApplication.user_id == worker.id)
-            .where(TaskApplication.status == ApplicationStatus.CONFIRMED.value)
-        )).scalars().all()
+def _split_report(header: str, lines: list[str], footer: str) -> list[str]:
+    chunks = []
+    current = header
 
-        penalties = (await session.execute(
-            select(func.coalesce(func.sum(TaskApplication.penalty_amount), 0))
-            .where(TaskApplication.user_id == worker.id)
-            .where(TaskApplication.status == ApplicationStatus.PENALTY.value)
-        )).scalar() or 0
+    for line in lines:
+        entry = line + "\n\n"
+        if len(current) + len(entry) + len(footer) > MAX_MESSAGE_LEN:
+            chunks.append(current)
+            current = ""
+        current += entry
 
-    confirmed_count = len(confirmed_apps)
-    coeff = get_coefficient(confirmed_count)
-
-    base_sum = sum(app.task.rate_for_rank(worker.rank) for app in confirmed_apps)
-    earned = base_sum * coeff - penalties
-
-    return earned, confirmed_count, penalties
+    current += footer
+    chunks.append(current)
+    return chunks

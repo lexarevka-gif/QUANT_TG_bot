@@ -26,13 +26,11 @@ async def cmd_help(message: Message):
 
     if is_admin:
         text += "\n🔧 Админ:\n"
-        text += "/new_task — создать задачу\n"
+        text += "/new_task — создать задачу (с нуля или из шаблона)\n"
         text += "/broadcast_task <ID> — разослать задачу работникам\n"
         text += "/send_details <ID> — отправить подробности записавшимся\n"
         text += "/tasks — список задач\n"
-        text += "/workers — список работников\n"
-        rank_list = ", ".join(f"{k}={v}" for k, v in sorted(RANKS.items()))
-        text += f"/set_rank <tg_id> <ранг> — ранги: {rank_list}\n"
+        text += "/workers — список работников (ранг, роль, удаление)\n"
         text += "/payroll — расчёт оплаты всех работников\n"
 
     await message.answer(text, reply_markup=kb)
@@ -64,5 +62,5 @@ async def btn_workers(message: Message):
 
 @router.message(F.text == "💰 Расчёт оплаты")
 async def btn_payroll(message: Message):
-    from handlers.admin import cmd_payroll
+    from handlers.payment import cmd_payroll
     await cmd_payroll(message)
