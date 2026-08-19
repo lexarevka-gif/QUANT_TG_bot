@@ -1,4 +1,5 @@
 import os
+from datetime import timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,32 +12,63 @@ WORKERS_PER_PAGE = 50
 BROADCAST_BATCH_SIZE = 25
 BROADCAST_DELAY = 1.0
 
+ADMIN_MIN_RANK = 7
+TZ_MOSCOW = timezone(timedelta(hours=3))
+
 RANKS = {
     0: "Без ранга",
     1: "Новичок",
-    2: "Стажёр",
+    2: "Стажер",
     3: "Активист",
-    4: "Помощник бригадира и выше",
+    4: "Помощник Специалиста",
+    5: "Специалист",
+    6: "Ведущий специалист",
+    7: "Менеджер",
+    8: "Заместитель Главы",
+    9: "Глава",
 }
 
 RANK_NAMES_TO_ID = {v: k for k, v in RANKS.items()}
+
+PAYMENT_TIERS = {
+    0: "Без ранга",
+    1: "Новичок",
+    2: "Стажер",
+    3: "Активист",
+    4: "Помощник Специалиста и выше",
+}
+
+
+def payment_tier_for_rank(rank: int) -> int:
+    return min(rank, 4)
+
 
 JOB_ROLES = [
     "Без роли",
     "Диджей",
     "СММ",
+    "Общие",
 ]
 
-TASK_COUNT_COEFFICIENTS = [
-    (5, 1.0),
-    (10, 1.1),
-    (20, 1.2),
-    (999999, 1.3),
+DEFAULT_DIVISIONS = [
+    ("Мгер", True),
+    ("Вол Рота", True),
+    ("Пикеты", False),
+    ("Спринт", True),
+    ("Коммерция", False),
+    ("МосЭкоПатруль", True),
+]
+
+MONTHLY_COEFFICIENTS = [
+    (3, 1.0),
+    (6, 1.2),
+    (15, 1.4),
+    (999999, 2.0),
 ]
 
 
-def get_coefficient(task_count: int) -> float:
-    for threshold, coeff in TASK_COUNT_COEFFICIENTS:
+def get_monthly_coefficient(task_count: int) -> float:
+    for threshold, coeff in MONTHLY_COEFFICIENTS:
         if task_count <= threshold:
             return coeff
     return 1.0
