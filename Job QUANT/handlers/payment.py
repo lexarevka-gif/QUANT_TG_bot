@@ -17,6 +17,8 @@ from datetime import datetime
 
 router = Router()
 
+MAX_MESSAGE_LEN = 4000
+
 
 class PeriodReport(StatesGroup):
     date_from = State()
@@ -137,6 +139,22 @@ def _parse_task_date(date_str: str) -> datetime | None:
     return None
 
 
+def _split_report(header: str, lines: list[str], footer: str) -> list[str]:
+    chunks = []
+    current = header
+
+    for line in lines:
+        entry = line + "\n\n"
+        if len(current) + len(entry) + len(footer) > MAX_MESSAGE_LEN:
+            chunks.append(current)
+            current = ""
+        current += entry
+
+    current += footer
+    chunks.append(current)
+    return chunks
+
+
 # --- Расчёт оплаты (за текущий месяц) ---
 
 @router.message(Command("payroll"))
@@ -155,7 +173,6 @@ async def cmd_payroll(message: Message):
         return
 
     now = datetime.utcnow()
-    month_name = now.strftime("%B %Y")
     lines = []
     total = 0.0
 
@@ -169,13 +186,18 @@ async def cmd_payroll(message: Message):
         )
         total += earned
 
-    report = f"💰 Расчёт оплаты ({now.strftime('%m.%Y')}):\n\n" + "\n\n".join(lines)
-    report += f"\n\n{'='*30}\nОбщий итог: {total:.0f}₽"
+    footer = f"\n{'=' * 30}\nОбщий итог: {total:.0f}₽"
+    header = f"💰 Расчёт оплаты ({now.strftime('%m.%Y')}):\n\n"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Отчёт за период", callback_data="period_report")]
-    ])
-    await message.answer(report, reply_markup=kb)
+    chunks = _split_report(header, lines, footer)
+    for i, chunk in enumerate(chunks):
+        if i == len(chunks) - 1:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📊 Отчёт за период", callback_data="period_report")]
+            ])
+            await message.answer(chunk, reply_markup=kb)
+        else:
+            await message.answer(chunk)
 
 
 # --- Экспорт Excel (за текущий месяц) ---
@@ -303,10 +325,12 @@ async def period_date_to(message: Message, state: FSMContext):
         await message.answer(f"За период {data['date_from_display']} — {message.text.strip()} данных нет.")
         return
 
-    report = f"📊 Отчёт за период {data['date_from_display']} — {message.text.strip()}:\n\n"
-    report += "\n\n".join(lines)
-    report += f"\n\n{'='*30}\nОбщий итог: {total:.0f}₽"
-    await message.answer(report)
+    header = f"📊 Отчёт за период {data['date_from_display']} — {message.text.strip()}:\n\n"
+    footer = f"\n{'=' * 30}\nОбщий итог: {total:.0f}₽"
+
+    chunks = _split_report(header, lines, footer)
+    for chunk in chunks:
+        await message.answer(chunk)
 
 
 # --- Статистика работника ---

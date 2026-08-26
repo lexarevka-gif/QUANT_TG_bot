@@ -1,14 +1,18 @@
+import asyncio
+import logging
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
 from database import async_session
-from models import User, Task, TaskApplication, TaskStatus, ApplicationStatus, Division
+from models import User, Task, TaskApplication, TaskPoint, TaskStatus, ApplicationStatus, Division
 from config import (
     ADMIN_IDS, ADMIN_MIN_RANK, RANKS, JOB_ROLES,
     rank_name, PAYMENT_TIERS, get_monthly_coefficient,
+    BROADCAST_BATCH_SIZE, BROADCAST_DELAY,
 )
 from datetime import datetime
 
@@ -32,6 +36,7 @@ class CreateTask(StatesGroup):
     date = State()
     time = State()
     location = State()
+    points = State()
     quota = State()
     role_filter = State()
     payment = State()
@@ -142,6 +147,41 @@ async def task_time(message: Message, state: FSMContext):
 async def task_location(message: Message, state: FSMContext):
     location = None if message.text.strip() == "-" else message.text.strip()
     await state.update_data(location=location)
+    await state.set_state(CreateTask.points)
+    await message.answer(
+        "📍 Укажите точки задачи (адрес | вместимость), каждую с новой строки.\n"
+        "Пример:\nул. Ленина 10 | 2\nпр. Мира 5 | 3\n\n"
+        "Или '-' если точек нет:"
+    )
+
+
+@router.message(CreateTask.points)
+async def task_points(message: Message, state: FSMContext):
+    txt = message.text.strip()
+    if txt == "-":
+        await state.update_data(points_data=[])
+    else:
+        points_data = []
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "|" not in line:
+                await message.answer("Неверный формат. Используйте: адрес | вместимость\nПопробуйте ещё раз:")
+                return
+            parts = line.split("|", 1)
+            address = parts[0].strip()
+            try:
+                capacity = int(parts[1].strip())
+            except ValueError:
+                await message.answer(f"Вместимость должна быть числом: «{parts[1].strip()}»\nПопробуйте ещё раз:")
+                return
+            if capacity < 1:
+                await message.answer("Вместимость должна быть >= 1. Попробуйте ещё раз:")
+                return
+            points_data.append({"address": address, "capacity": capacity})
+        await state.update_data(points_data=points_data)
+
     await state.set_state(CreateTask.quota)
     await message.answer("Максимальное количество работников (или '-' без ограничения):")
 
@@ -227,13 +267,19 @@ async def task_payment(message: Message, state: FSMContext):
         )
         task.payment_rates = rates
         session.add(task)
-        await session.commit()
+        await session.flush()
         task_id = task.id
+
+        points_data = data.get("points_data", [])
+        for pd in points_data:
+            session.add(TaskPoint(task_id=task_id, address=pd["address"], capacity=pd["capacity"]))
 
         div_name = ""
         if task.division_id:
             div = (await session.execute(select(Division).where(Division.id == task.division_id))).scalar_one_or_none()
             div_name = div.name if div else ""
+
+        await session.commit()
 
     await state.clear()
 
@@ -252,6 +298,11 @@ async def task_payment(message: Message, state: FSMContext):
         summary += f"👥 Макс: {data['max_workers']}\n"
     if data.get("job_role_filter"):
         summary += f"💼 Роль: {data['job_role_filter']}\n"
+
+    if points_data:
+        summary += "\n📍 Точки:\n"
+        for pd in points_data:
+            summary += f"  • {pd['address']} (мест: {pd['capacity']})\n"
 
     summary += "\n💰 Оплата:\n"
     for tier_id in sorted(rates.keys()):
@@ -577,12 +628,14 @@ async def cb_tmpl_create(callback: CallbackQuery, state: FSMContext):
 
 
 # ====================================================================
-# Рассылка задачи
+# Рассылка задачи (с троттлингом и поддержкой точек)
 # ====================================================================
 
 async def _broadcast_task(bot, task_id: int, reply_func):
     async with async_session() as session:
-        result = await session.execute(select(Task).where(Task.id == task_id))
+        result = await session.execute(
+            select(Task).options(selectinload(Task.points)).where(Task.id == task_id)
+        )
         task = result.scalar_one_or_none()
         if not task:
             await reply_func("Задача не найдена.")
@@ -599,12 +652,13 @@ async def _broadcast_task(bot, task_id: int, reply_func):
             div = (await session.execute(select(Division).where(Division.id == task.division_id))).scalar_one_or_none()
             div_name = div.name if div else ""
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Записаться", callback_data=f"apply_{task.id}")]
-    ])
+        points = task.points
+
+    has_points = bool(points)
 
     sent = 0
-    for worker in workers:
+    errors = 0
+    for i, worker in enumerate(workers):
         worker_rate = task.rate_for_rank(worker.rank)
         text = f"📢 Новая задача #{task.id}!\n\n"
         text += f"📋 {task.title}\n"
@@ -621,13 +675,33 @@ async def _broadcast_task(bot, task_id: int, reply_func):
         if task.max_workers:
             text += f"\n👥 Мест: {task.max_workers}"
 
+        if has_points:
+            text += "\n\n📍 Выберите точку:"
+            buttons = []
+            for pt in points:
+                buttons.append([InlineKeyboardButton(
+                    text=f"📍 {pt.address} (мест: {pt.capacity})",
+                    callback_data=f"applypoint_{task.id}_{pt.id}",
+                )])
+            kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Записаться", callback_data=f"apply_{task.id}")]
+            ])
+
         try:
             await bot.send_message(worker.tg_id, text, reply_markup=kb)
             sent += 1
         except Exception:
-            pass
+            errors += 1
 
-    await reply_func(f"Задача отправлена {sent} работникам.")
+        if (i + 1) % BROADCAST_BATCH_SIZE == 0:
+            await asyncio.sleep(BROADCAST_DELAY)
+
+    result_text = f"Задача отправлена {sent} работникам."
+    if errors:
+        result_text += f"\n⚠️ Ошибок: {errors}"
+    await reply_func(result_text)
 
 
 @router.message(Command("broadcast_task"))
@@ -652,7 +726,7 @@ async def cb_broadcast_task(callback: CallbackQuery):
 
 
 # ====================================================================
-# Отправка подробностей
+# Отправка подробностей (с троттлингом)
 # ====================================================================
 
 @router.message(Command("send_details"))
@@ -699,18 +773,25 @@ async def send_details_text(message: Message, state: FSMContext):
 
     text = f"📋 Подробности по задаче #{task_id} — {task.title}\n\n{details}"
     sent = 0
-    for user in users:
+    errors = 0
+    for i, user in enumerate(users):
         try:
             await message.bot.send_message(user.tg_id, text)
             sent += 1
         except Exception:
-            pass
+            errors += 1
+        if (i + 1) % BROADCAST_BATCH_SIZE == 0:
+            await asyncio.sleep(BROADCAST_DELAY)
+
     await state.clear()
-    await message.answer(f"Подробности отправлены {sent} работникам.")
+    result_text = f"Подробности отправлены {sent} работникам."
+    if errors:
+        result_text += f"\n⚠️ Ошибок: {errors}"
+    await message.answer(result_text)
 
 
 # ====================================================================
-# Массовая рассылка
+# Массовая рассылка (с троттлингом)
 # ====================================================================
 
 @router.message(Command("mass_send"))
@@ -728,13 +809,19 @@ async def process_mass_send(message: Message, state: FSMContext):
     async with async_session() as session:
         workers = (await session.execute(select(User).where(User.role == "worker"))).scalars().all()
     sent = 0
-    for w in workers:
+    errors = 0
+    for i, w in enumerate(workers):
         try:
             await message.bot.send_message(w.tg_id, f"📢 Сообщение от администрации:\n\n{text}")
             sent += 1
         except Exception:
-            pass
-    await message.answer(f"Сообщение отправлено {sent} работникам.")
+            errors += 1
+        if (i + 1) % BROADCAST_BATCH_SIZE == 0:
+            await asyncio.sleep(BROADCAST_DELAY)
+    result_text = f"Сообщение отправлено {sent} работникам."
+    if errors:
+        result_text += f"\n⚠️ Ошибок: {errors}"
+    await message.answer(result_text)
 
 
 # ====================================================================
@@ -992,7 +1079,6 @@ async def _calc_worker_monthly_stats(user_id: int, user_rank: int):
         month_end = f"{year:04d}-{month + 1:02d}-01"
 
     async with async_session() as session:
-        from sqlalchemy.orm import selectinload
         confirmed_apps = (await session.execute(
             select(TaskApplication)
             .options(selectinload(TaskApplication.task))
@@ -1318,9 +1404,17 @@ async def cb_task_card(callback: CallbackQuery):
     text += f"  Не пришли: {not_showed}\n"
     text += f"  Штрафы: {penalty}\n"
 
+    photo_count = sum(1 for a in apps if a.photo_start_file_id)
+    pending_review = sum(1 for a in apps if a.status == ApplicationStatus.PHOTO_END.value)
+
     buttons = []
     if task.status == TaskStatus.OPEN.value:
         buttons.append([InlineKeyboardButton(text="📢 Разослать работникам", callback_data=f"broadcast_{task_id}")])
+    if photo_count > 0:
+        photo_btn = f"📸 Фотоотчёты ({photo_count})"
+        if pending_review:
+            photo_btn += f" | 🔍 {pending_review}"
+        buttons.append([InlineKeyboardButton(text=photo_btn, callback_data=f"taskphotos_{task_id}")])
     if task.status in (TaskStatus.OPEN.value, TaskStatus.IN_PROGRESS.value):
         buttons.append([InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edittask_{task_id}")])
         buttons.append([InlineKeyboardButton(text="🔒 Закрыть задачу", callback_data=f"closetask_{task_id}")])
@@ -1648,7 +1742,7 @@ async def cb_notify_workers(callback: CallbackQuery):
         text += f"🏢 {div_name}\n"
 
     sent = 0
-    for app in apps:
+    for i, app in enumerate(apps):
         async with async_session() as session:
             user = (await session.execute(select(User).where(User.id == app.user_id))).scalar_one_or_none()
         if user:
@@ -1657,5 +1751,7 @@ async def cb_notify_workers(callback: CallbackQuery):
                 sent += 1
             except Exception:
                 pass
+        if (i + 1) % BROADCAST_BATCH_SIZE == 0:
+            await asyncio.sleep(BROADCAST_DELAY)
 
     await callback.answer(f"Уведомлено: {sent}", show_alert=True)
