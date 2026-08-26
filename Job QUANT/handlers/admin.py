@@ -1404,9 +1404,17 @@ async def cb_task_card(callback: CallbackQuery):
     text += f"  Не пришли: {not_showed}\n"
     text += f"  Штрафы: {penalty}\n"
 
+    photo_count = sum(1 for a in apps if a.photo_start_file_id)
+    pending_review = sum(1 for a in apps if a.status == ApplicationStatus.PHOTO_END.value)
+
     buttons = []
     if task.status == TaskStatus.OPEN.value:
         buttons.append([InlineKeyboardButton(text="📢 Разослать работникам", callback_data=f"broadcast_{task_id}")])
+    if photo_count > 0:
+        photo_btn = f"📸 Фотоотчёты ({photo_count})"
+        if pending_review:
+            photo_btn += f" | 🔍 {pending_review}"
+        buttons.append([InlineKeyboardButton(text=photo_btn, callback_data=f"taskphotos_{task_id}")])
     if task.status in (TaskStatus.OPEN.value, TaskStatus.IN_PROGRESS.value):
         buttons.append([InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edittask_{task_id}")])
         buttons.append([InlineKeyboardButton(text="🔒 Закрыть задачу", callback_data=f"closetask_{task_id}")])

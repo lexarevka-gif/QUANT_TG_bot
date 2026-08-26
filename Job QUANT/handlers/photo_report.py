@@ -8,7 +8,7 @@ from sqlalchemy.orm import selectinload
 from database import async_session
 from models import User, Task, TaskApplication, ApplicationStatus, TaskStatus
 from handlers.admin import is_admin
-from handlers.tasks import _get_admins
+from config import rank_name
 from datetime import datetime, timedelta
 from config import TZ_MOSCOW
 
@@ -281,19 +281,6 @@ async def receive_photo_start(message: Message, state: FSMContext):
         f"По завершении нажмите «📸 Фотоотчёт» чтобы отправить фото конца."
     )
 
-    admins = await _get_admins()
-    for admin in admins:
-        try:
-            await message.bot.send_photo(
-                admin.tg_id,
-                photo_file_id,
-                caption=f"📸 Фото НАЧАЛА\n"
-                        f"Задача: #{task_id} — {task.title}\n"
-                        f"Работник: {user.full_name}\n"
-                        f"Время: {_now_msk().strftime('%H:%M %d.%m.%Y')}",
-            )
-        except Exception:
-            pass
 
 
 @router.message(PhotoEnd.waiting_photo, F.photo)
@@ -328,30 +315,6 @@ async def receive_photo_end(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Фото конца принято для задачи #{task_id}. Ожидайте подтверждения от админа.")
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_{app.id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{app.id}"),
-        ],
-        [
-            InlineKeyboardButton(text="⚠️ Штраф", callback_data=f"penalize_{app.id}"),
-        ],
-    ])
-
-    admins = await _get_admins()
-    for admin in admins:
-        try:
-            await message.bot.send_photo(
-                admin.tg_id,
-                photo_file_id,
-                caption=f"📸 Фото КОНЦА\n"
-                        f"Задача: #{task_id} — {task.title}\n"
-                        f"Работник: {user.full_name}\n"
-                        f"Время: {_now_msk().strftime('%H:%M %d.%m.%Y')}",
-                reply_markup=kb,
-            )
-        except Exception:
-            pass
 
 
 # ====================================================================
@@ -492,3 +455,126 @@ async def process_penalty_amount(message: Message, state: FSMContext):
         )
     except Exception:
         pass
+
+
+# ====================================================================
+# Просмотр фотоотчётов (админ, по запросу из карточки задачи)
+# ====================================================================
+
+@router.callback_query(F.data.startswith("taskphotos_"))
+async def cb_task_photos(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    task_id = int(callback.data.split("_")[1])
+
+    async with async_session() as session:
+        task = (await session.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+        if not task:
+            await callback.answer("Задача не найдена.", show_alert=True)
+            return
+
+        apps = (await session.execute(
+            select(TaskApplication)
+            .options(selectinload(TaskApplication.user))
+            .where(
+                TaskApplication.task_id == task_id,
+                TaskApplication.photo_start_file_id.isnot(None),
+            )
+            .order_by(TaskApplication.id)
+        )).scalars().all()
+
+    if not apps:
+        await callback.answer("Фотоотчётов пока нет.", show_alert=True)
+        return
+
+    status_map = {
+        ApplicationStatus.PHOTO_START.value: "📸",
+        ApplicationStatus.PHOTO_END.value: "🔍",
+        ApplicationStatus.CONFIRMED.value: "✅",
+        ApplicationStatus.NOT_SHOWED.value: "❌",
+        ApplicationStatus.PENALTY.value: "⚠️",
+    }
+
+    buttons = []
+    for app in apps:
+        emoji = status_map.get(app.status, "📝")
+        label = f"{emoji} {app.user.full_name} ({rank_name(app.user.rank)})"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"viewphotos_{app.id}")])
+
+    buttons.append([InlineKeyboardButton(text="◀️ К задаче", callback_data=f"taskcard_{task_id}")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    text = (
+        f"📸 Фотоотчёты — задача #{task_id}\n\n"
+        f"📸 — фото начала\n"
+        f"🔍 — ожидает проверки\n"
+        f"✅ — подтверждено  ❌ — отклонено  ⚠️ — штраф"
+    )
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("viewphotos_"))
+async def cb_view_worker_photos(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        return
+    app_id = int(callback.data.split("_")[1])
+
+    async with async_session() as session:
+        app = (await session.execute(
+            select(TaskApplication)
+            .options(selectinload(TaskApplication.user), selectinload(TaskApplication.task))
+            .where(TaskApplication.id == app_id)
+        )).scalar_one_or_none()
+
+        if not app:
+            await callback.answer("Заявка не найдена.", show_alert=True)
+            return
+
+    user = app.user
+    task = app.task
+
+    if app.photo_start_file_id:
+        start_time = app.photo_start_time.strftime('%H:%M %d.%m.%Y') if app.photo_start_time else "—"
+        await callback.message.answer_photo(
+            photo=app.photo_start_file_id,
+            caption=(
+                f"📸 Фото НАЧАЛА\n"
+                f"Задача: #{task.id} — {task.title}\n"
+                f"Работник: {user.full_name}\n"
+                f"Время: {start_time}"
+            ),
+        )
+
+    if app.photo_end_file_id:
+        end_time = app.photo_end_time.strftime('%H:%M %d.%m.%Y') if app.photo_end_time else "—"
+        caption = (
+            f"📸 Фото КОНЦА\n"
+            f"Задача: #{task.id} — {task.title}\n"
+            f"Работник: {user.full_name}\n"
+            f"Время: {end_time}"
+        )
+
+        if app.status == ApplicationStatus.PHOTO_END.value:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_{app.id}"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{app.id}"),
+                ],
+                [
+                    InlineKeyboardButton(text="⚠️ Штраф", callback_data=f"penalize_{app.id}"),
+                ],
+            ])
+            await callback.message.answer_photo(photo=app.photo_end_file_id, caption=caption, reply_markup=kb)
+        else:
+            status_text = {
+                ApplicationStatus.CONFIRMED.value: "\n\n✅ ПОДТВЕРЖДЕНО",
+                ApplicationStatus.NOT_SHOWED.value: "\n\n❌ ОТКЛОНЕНО",
+                ApplicationStatus.PENALTY.value: f"\n\n⚠️ ШТРАФ {app.penalty_amount:.0f}₽",
+            }
+            await callback.message.answer_photo(
+                photo=app.photo_end_file_id,
+                caption=caption + status_text.get(app.status, ""),
+            )
+
+    await callback.answer()
